@@ -1,5 +1,5 @@
 /*!                                                              
- * LeapJS v0.4.3                                                  
+ * LeapJS v0.5.0                                                  
  * http://github.com/leapmotion/leapjs/                                        
  *                                                                             
  * Copyright 2013 LeapMotion, Inc. and other contributors                      
@@ -36,7 +36,7 @@ var BaseConnection = module.exports = function(opts) {
     enableGestures: false,
     port: 6437,
     background: false,
-    requestProtocolVersion: 4
+    requestProtocolVersion: 5
   });
   this.host = this.opts.host;
   this.port = this.opts.port;
@@ -89,15 +89,25 @@ BaseConnection.prototype.handleClose = function(code, reason) {
 
 BaseConnection.prototype.startReconnection = function() {
   var connection = this;
-  this.reconnectionTimer = setInterval(function() { connection.reconnect() }, 1000);
+  if(!this.reconnectionTimer){
+    (this.reconnectionTimer = setInterval(function() { connection.reconnect() }, 500));
+  }
 }
 
-BaseConnection.prototype.disconnect = function() {
+BaseConnection.prototype.stopReconnection = function() {
+  this.reconnectionTimer = clearInterval(this.reconnectionTimer);
+}
+
+// By default, disconnect will prevent auto-reconnection.
+// Pass in true to allow the reconnection loop not be interrupted continue
+BaseConnection.prototype.disconnect = function(allowReconnect) {
+  if (!allowReconnect) this.stopReconnection();
   if (!this.socket) return;
   this.socket.close();
   delete this.socket;
   delete this.protocol;
   delete this.background; // This is not persisted when reconnecting to the web socket server
+  delete this.focusedState;
   if (this.connected) {
     this.connected = false;
     this.emit('disconnect');
@@ -107,9 +117,9 @@ BaseConnection.prototype.disconnect = function() {
 
 BaseConnection.prototype.reconnect = function() {
   if (this.connected) {
-    clearInterval(this.reconnectionTimer);
+    this.stopReconnection();
   } else {
-    this.disconnect();
+    this.disconnect(true);
     this.connect();
   }
 }
@@ -139,7 +149,7 @@ BaseConnection.prototype.send = function(data) {
 }
 
 BaseConnection.prototype.reportFocus = function(state) {
-  if (this.focusedState === state) return;
+  if (!this.connected || this.focusedState === state) return;
   this.focusedState = state;
   this.emit(this.focusedState ? 'focus' : 'blur');
   if (this.protocol && this.protocol.sendFocused) {
@@ -211,6 +221,9 @@ BrowserConnection.prototype.startFocusLoop = function() {
     var isVisible = propertyName === undefined ? true : document[propertyName] === false;
     connection.reportFocus(isVisible && connection.windowVisible);
   }
+
+  // save 100ms when resuming focus
+  updateFocusState();
 
   this.focusDetectorTimer = setInterval(updateFocusState, 100);
 }
@@ -304,6 +317,8 @@ var Controller = module.exports = function(opts) {
     this.connectionType = opts.connectionType;
   }
   this.connection = new this.connectionType(opts);
+  this.streamingCount = 0;
+  this.devices = {};
   this.plugins = {};
   this._pluginPipelineSteps = {};
   this._pluginExtendedMethods = {};
@@ -351,6 +366,14 @@ Controller.prototype.connect = function() {
   return this;
 }
 
+Controller.prototype.streaming = function() {
+  return this.streamingCount > 0;
+}
+
+Controller.prototype.connected = function() {
+  return !!this.connection.connected;
+}
+
 Controller.prototype.runAnimationLoop = function(){
   if (!this.suppressAnimationLoop && !this.animationFrameRequested) {
     this.animationFrameRequested = true;
@@ -381,7 +404,7 @@ Controller.prototype.disconnect = function() {
  * @returns {Leap.Frame} The specified frame; or, if no history
  * parameter is specified, the newest frame. If a frame is not available at
  * the specified history position, an invalid Frame is returned.
- */
+ **/
 Controller.prototype.frame = function(num) {
   return this.history.get(num) || Frame.Invalid;
 }
@@ -447,23 +470,160 @@ Controller.prototype.processFinishedFrame = function(frame) {
   this.emit('frame', frame);
 }
 
+/**
+  Controller events.  The old 'deviceConnected' and 'deviceDisconnected' have been depricated -
+  use 'deviceStreaming' and 'deviceStopped' instead, except in the case of an unexpected disconnect.
+
+  There are 4 pairs of device events recently added/changed:
+  -deviceAttached/deviceRemoved - called when a device's physical connection to the computer changes
+  -deviceStreaming/deviceStopped - called when a device is paused or resumed.
+  -streamingStarted/streamingStopped - called when there is/is no longer at least 1 streaming device.
+									  Always comes after deviceStreaming.
+  
+  The first of all of the above event pairs is triggered as appropriate upon connection.  All of
+  these events receives an argument with the most recent info about the device that triggered it.
+  These events will always be fired in the order they are listed here, with reverse ordering for the
+  matching shutdown call. (ie, deviceStreaming always comes after deviceAttached, and deviceStopped 
+  will come before deviceRemoved).
+  
+  -deviceConnected/deviceDisconnected - These are considered deprecated and will be removed in
+  the next revision.  In contrast to the other events and in keeping with it's original behavior,
+  it will only be fired when a device begins streaming AFTER a connection has been established.
+  It is not paired, and receives no device info.  Nearly identical functionality to
+  streamingStarted/Stopped if you need to port.
+*/
 Controller.prototype.setupConnectionEvents = function() {
   var controller = this;
   this.connection.on('frame', function(frame) {
     controller.processFrame(frame);
   });
+  // either deviceFrame or animationFrame:
   this.on(this.frameEventName, function(frame) {
     controller.processFinishedFrame(frame);
   });
 
+
+  // here we backfill the 0.5.0 deviceEvents as best possible
+  // backfill begin streaming events
+  var backfillStreamingStartedEventsHandler = function(){
+    if (controller.connection.opts.requestProtocolVersion < 5 && controller.streamingCount == 0){
+      controller.streamingCount = 1;
+      var info = {
+        attached: true,
+        streaming: true,
+        type: 'unknown',
+        id: "Lx00000000000"
+      };
+      controller.devices[info.id] = info;
+
+      controller.emit('deviceAttached', info);
+      controller.emit('deviceStreaming', info);
+      controller.emit('streamingStarted', info);
+      controller.connection.removeListener('frame', backfillStreamingStartedEventsHandler)
+    }
+  }
+
+  var backfillStreamingStoppedEvents = function(){
+    if (controller.streamingCount > 0) {
+      for (var deviceId in controller.devices){
+        controller.emit('deviceStopped', controller.devices[deviceId]);
+        controller.emit('deviceRemoved', controller.devices[deviceId]);
+      }
+      // only emit streamingStopped once, with the last device
+      controller.emit('streamingStopped', controller.devices[deviceId]);
+
+      controller.streamingCount = 0;
+
+      for (var deviceId in controller.devices){
+        delete controller.devices[deviceId];
+      }
+    }
+  }
   // Delegate connection events
-  this.connection.on('disconnect', function() { controller.emit('disconnect'); });
-  this.connection.on('ready', function() { controller.emit('ready'); });
-  this.connection.on('connect', function() { controller.emit('connect'); });
   this.connection.on('focus', function() { controller.emit('focus'); controller.runAnimationLoop(); });
   this.connection.on('blur', function() { controller.emit('blur') });
   this.connection.on('protocol', function(protocol) { controller.emit('protocol', protocol); });
-  this.connection.on('deviceConnect', function(evt) { controller.emit(evt.state ? 'deviceConnected' : 'deviceDisconnected'); });
+  this.connection.on('ready', function() { controller.emit('ready'); });
+
+  this.connection.on('connect', function() {
+    controller.emit('connect');
+    controller.connection.removeListener('frame', backfillStreamingStartedEventsHandler)
+    controller.connection.on('frame', backfillStreamingStartedEventsHandler);
+  });
+
+  this.connection.on('disconnect', function() {
+    controller.emit('disconnect');
+    backfillStreamingStoppedEvents();
+  });
+
+  // this does not fire when the controller is manually disconnected
+  // or for Leap Service v1.2.0+
+  this.connection.on('deviceConnect', function(evt) {
+    if (evt.state){
+      controller.emit('deviceConnected');
+      controller.connection.removeListener('frame', backfillStreamingStartedEventsHandler)
+      controller.connection.on('frame', backfillStreamingStartedEventsHandler);
+    }else{
+      controller.emit('deviceDisconnected');
+      backfillStreamingStoppedEvents();
+    }
+  });
+
+  // Does not fire for Leap Service pre v1.2.0
+  this.connection.on('deviceEvent', function(evt) {
+    var info = evt.state,
+        oldInfo = controller.devices[info.id];
+
+    //Grab a list of changed properties in the device info
+    var changed = {};
+    for(var property in info) {
+      //If a property i doesn't exist the cache, or has changed...
+      if( !oldInfo || !oldInfo.hasOwnProperty(property) || oldInfo[property] != info[property] ) {
+        changed[property] = true;
+      }
+    }
+
+    //Update the device list
+    controller.devices[info.id] = info;
+
+    //Fire events based on change list
+    if(changed.attached) {
+      controller.emit(info.attached ? 'deviceAttached' : 'deviceRemoved', info);
+    }
+
+    if(!changed.streaming) return;
+
+    if(info.streaming) {
+      controller.streamingCount++;
+      controller.emit('deviceStreaming', info);
+      if( controller.streamingCount == 1 ) {
+        controller.emit('streamingStarted', info);
+      }
+      //if attached & streaming both change to true at the same time, that device was streaming
+      //already when we connected.
+      if(!changed.attached) {
+        controller.emit('deviceConnected');
+      }
+    }
+    //Since when devices are attached all fields have changed, don't send events for streaming being false.
+    else if(!(changed.attached && info.attached)) {
+      controller.streamingCount--;
+      controller.emit('deviceStopped', info);
+      if(controller.streamingCount == 0){
+        controller.emit('streamingStopped', info);
+      }
+      controller.emit('deviceDisconnected');
+    }
+
+  });
+
+
+  this.on('newListener', function(event, listener) {
+    if( event == 'deviceConnected' || event == 'deviceDisconnected' ) {
+      console.warn(event + " events are depricated.  Consider using 'streamingStarted/streamingStopped' or 'deviceStreaming/deviceStopped' instead");
+    }
+  });
+
 }
 
 /*
@@ -2122,7 +2282,6 @@ module.exports = {
       callback = opts;
       opts = {};
     }
-    (typeof opts.useAllPlugins == 'undefined') && (opts.useAllPlugins = true)
     if (!this.loopController) this.loopController = new this.Controller(opts);
     this.loopController.loop(callback);
     return this.loopController;
@@ -2700,16 +2859,18 @@ var Event = function(data) {
   this.state = data.state;
 };
 
-var chooseProtocol = exports.chooseProtocol = function(header) {
+exports.chooseProtocol = function(header) {
   var protocol;
   switch(header.version) {
     case 1:
     case 2:
     case 3:
     case 4:
+    case 5:
       protocol = JSONProtocol(header.version, function(data) {
         return data.event ? new Event(data.event) : new Frame(data);
       });
+      protocol.serviceVersion = header.serviceVersion
       protocol.sendBackground = function(connection, state) {
         connection.send(protocol.encode({background: state}));
       }
@@ -2841,10 +3002,10 @@ _.extend(Region.prototype, EventEmitter.prototype)
 },{"events":19,"underscore":22}],17:[function(require,module,exports){
 // This file is automatically updated from package.json by grunt.
 module.exports = {
-  full: '0.4.3',
+  full: "0.5.0",
   major: 0,
-  minor: 4,
-  dot: 3
+  minor: 5,
+  dot: 0
 }
 },{}],18:[function(require,module,exports){
 
